@@ -33,33 +33,36 @@ Everything else (history list, profile, subscription) is supporting infrastructu
 - When the app receives a shared URL, it sends it to the server and navigates straight to the player (which will show a transcribing state until ready).
 
 ### Player screen (the main view)
-Vertical layout, three stacked zones:
+Vertical layout. The teleprompter is **always overlaid on the video region** (never shrinks the video). The translation pane is a separate band at the bottom of the screen.
 
-1. **Video zone** (top): YouTube player. Center play button fades out a couple of seconds after play, fades in on tap or pause. Tapping the video toggles play/pause.
-2. **Teleprompter zone** (middle, ~half from bottom, expandable to ~two-thirds): semi-transparent dark drawer with rounded top corners, overlaid on top of the video region. Words flow as wrapped text and auto-scroll so the currently-spoken word stays roughly in the middle. Sans-serif, white text. The currently-spoken word is highlighted (karaoke style). Tapping a word:
-   - pauses the video,
-   - outlines that word,
-   - opens (or updates) the translation pane.
-3. **Translation pane** (bottom third, appears when a word is tapped):
+1. **Video zone** (top, fills the screen behind everything): YouTube IFrame player. Center play button fades out a couple of seconds after play, fades in on tap or pause. Tapping the video toggles play/pause. Includes a small playback-speed control (e.g., 0.5x / 0.75x / 1x / 1.25x / 1.5x).
+2. **Teleprompter zone** (overlay on the video): semi-transparent dark panel with rounded top corners. Sans-serif white text, words wrap and auto-scroll so the currently-spoken word stays roughly in the middle. The currently-spoken word is **always highlighted (karaoke style)** in sync with playback, even without any tap. Two states (no draggable snap points, no free-drag — the panel snaps between these two layouts based on selection state):
+   - **Default state (no word selected, while video plays):** teleprompter covers the entire bottom half of the screen, fully overlaying the (still hidden) translation pane area.
+   - **Word-selected state:** teleprompter shrinks vertically to the same size area but positioned so its **bottom edge sits exactly on top of the translation pane**, with a slight overlap onto the video above. The translation pane is now fully visible below it.
+3. **Translation pane** (bottom band, appears only when a word is tapped):
    - Row 1: original word + small play button (TTS in source language).
    - Row 2: translated word + play button that toggles to a stop button while audio is playing.
    - Row 3 (smaller text): explanation in target language + example sentence in source language.
    - Pressing "play all" plays: original word → translated word → explanation → example, in sequence. Any other tap interrupts playback.
 
-**Open UX questions worth resolving early:**
-- Is the teleprompter overlaid on the video, or does opening it shrink the video? The description says "moves over the video" — confirm.
-- Does the drawer have two snap points (half / two-thirds) or is it freely draggable?
-- When the translation pane is open, where does the teleprompter go? Above it, in the upper-middle? Confirm visual stack.
-- Should the current word auto-highlight as the video plays, even without tapping? (Strongly recommended — this is what makes the teleprompter useful for learning.)
-- Tap a **phrase** vs. a word? Language learners often want a phrase translated. v1 can be word-only; mention as a v2 candidate.
-- Loop a sentence / replay last 5 seconds — common language-learning feature. v2?
-- Variable playback speed (0.75x, 0.5x) — useful for learners. YouTube player supports this.
+**Word tap behaviour:** the user taps exactly one word (no multi-word selection in v1). The video pauses, the tapped word gets an outline, and the teleprompter snaps to the word-selected state. The client sends `{video_id, word_index}` to the server, which builds the lookup using the **full surrounding sentence** as context for the LLM (the model sees more than the single word, even though the UI only highlights one word).
+
+**Player controls also include:**
+- **Begin-of-sentence back button** — jumps the video back to the start of the current sentence (sentence boundaries come from Soniox punctuation or are inferred from the transcript).
+- **Playback speed control** (0.5x, 0.75x, 1x, 1.25x, 1.5x).
 
 ### Profile screen
 - Target language picker.
 - Source language preference (auto-detect per video vs. fixed).
 - Subscription status + "Manage subscription" button → opens website in browser.
+- Link to **Saved words** list (see below).
 - Sign out.
+
+### Saved words screen
+- List of words the user has saved while watching videos (a star/save button on the translation pane writes to the server).
+- Each row: original word, translation, source language, target language, and a link back to the source video at the saved position.
+- Tap a row to re-play the TTS or jump back to the moment in the video.
+- This is a v1 feature.
 
 ---
 
@@ -87,12 +90,13 @@ Vertical layout, three stacked zones:
 └────────────┘
 ```
 
-### Key architectural decisions to make
-- **Server language/runtime**: Node.js (TypeScript) + Fastify/Express, **or** Python + FastAPI. Both work. Python has slightly nicer audio tooling; Node makes it easier to share types with the website if it's TS-based. Pick one and stick with it.
-- **Job queue**: BullMQ (Node + Redis) or Celery/RQ (Python + Redis). Required because transcription is async and can take minutes.
-- **Storage**: "Temp folder" is fine for dev, but audio files and TTS clips should be on S3/R2/MinIO in production so workers can be horizontally scaled and the API box stays stateless.
-- **Video playback**: Use the YouTube IFrame player inside Flutter (`youtube_player_iframe`). **The server should not host or re-stream video.** The server only needs the audio for transcription. This avoids the legal/ToS minefield of redistributing YouTube content and dramatically lowers bandwidth costs.
-- **Audio extraction**: `yt-dlp -x --audio-format m4a <url>` on the server. Keep the audio long enough to transcribe, then delete (keep only the transcript JSON).
+### Key architectural decisions (resolved)
+- **Server language/runtime**: **Node.js (TypeScript)**. Fastify or Express on the API side; same language and types reused on the website.
+- **Job queue**: **BullMQ** (Node + Redis). Required because transcription is async — Soniox reports ~1 minute of processing per hour of audio, so jobs are short but still need a queue for retries, concurrency control, and worker isolation from the API process.
+- **Database**: **PostgreSQL** is the source of truth for transcriptions and their status. The list of transcriptions shown in the app is a query against the DB, not a scan of the temp folder or the queue.
+- **Storage**: **Temp folder** in dev. **S3 / Cloudflare R2 / MinIO** in production so workers can be scaled horizontally and the API stays stateless. Audio files are deleted after transcription completes; only the transcript JSON (in Postgres) and any TTS clips (in object storage) are kept.
+- **Video playback**: **YouTube IFrame player inside Flutter** (`youtube_player_iframe`). The server **never** hosts or re-streams video. The server only ever needs the audio, and only long enough to transcribe it. This avoids redistributing YouTube content and keeps bandwidth costs near zero.
+- **Audio extraction**: download on the server using whatever works — most likely `yt-dlp -x --audio-format m4a <url>`, or alternatively download the video and convert with `ffmpeg -i input.mp4 -vn -c:a aac output.m4a`. The transcoded audio goes straight to Soniox, then the temp file is deleted. Only the transcript JSON is kept.
 
 ---
 
@@ -115,14 +119,14 @@ Vertical layout, three stacked zones:
 
 ## 5. Translation pipeline (per-word lookup)
 
-When the user taps a word, the client sends `{video_id, word_index}` to the server (not the raw word — the index gives the server full context).
+When the user taps a word, the client sends `{video_id, word_index}` to the server (not the raw word — the index gives the server full sentence context).
 
 Server:
 1. Look up cache: `(youtube_id, word_index, target_language)` → return immediately if present.
-2. Otherwise, build a prompt for an LLM with: the word, the surrounding sentence as context, source language, target language. Ask for: translation (in target lang), short explanation (in target lang), example sentence (in source lang, different from the source sentence).
+2. Otherwise, build a prompt for an LLM with: the word, the **full surrounding sentence** as context, source language, target language. Ask for: translation (in target lang), short explanation (in target lang), example sentence (in source lang, different from the source sentence).
 3. Cache the result. Return to client.
 
-Per-word translation **needs context** — "right" means very different things in "turn right" vs. "you are right" vs. "right now." A bare dictionary lookup is not acceptable for a learning app. An LLM call per uncached word is the right call. The cache hit rate will be very high for popular videos.
+Per-word translation **needs sentence context** — "right" means very different things in "turn right" vs. "you are right" vs. "right now." Even though the UI highlights one word, the model must see the whole sentence. A bare dictionary lookup is not acceptable for a learning app. An LLM call per uncached word is the right call. The cache hit rate will be very high for popular videos.
 
 ---
 
@@ -175,7 +179,7 @@ Recommend **Option A** for v1. Simpler to communicate, simpler to enforce, simpl
 - `subscriptions` — `id, user_id, plan, status, paypal_subscription_id, current_period_start, current_period_end, cancelled_at`
 - `addon_purchases` — `id, user_id, hours, paypal_order_id, purchased_at`
 - `usage_log` — `id, user_id, video_id, kind (transcribe|tts|lookup), units, occurred_at` — drives quota enforcement and analytics
-- `saved_words` (v2 candidate) — flashcard list
+- `saved_words` (v1) — `id, user_id, video_id, word_index, original_word, translation, source_lang, target_lang, video_position_seconds, saved_at`
 
 ---
 
@@ -195,29 +199,40 @@ Stack should match the API server's language to share code. If Node/TS: Next.js.
 ## 11. Things the user didn't mention but probably wants
 
 - **Source-language selection per video** (or auto-detect via Soniox). Most users won't know to set this.
-- **Karaoke-style word highlighting** synced to playback. Without this, the teleprompter is just static scrolling text and the value proposition is much weaker.
 - **Resume playback** at last position.
 - **Delete a video from history.**
 - **Quota / "remaining hours" indicator** somewhere visible — otherwise users don't know what they're paying for.
 - **Error states**: video is private, age-restricted, too long, geo-blocked, transcription failed. Each needs a user-facing message.
 - **Max video duration cap** in v1 (e.g., 60 minutes) to keep transcription costs predictable.
-- **Saved words / flashcards** — natural extension; even just a "star this word" button stored server-side has high learning value. Probably v2.
+
+Already confirmed for v1 (no longer open questions): karaoke word highlighting, saved words list, begin-of-sentence back button, playback speed control.
 
 ---
 
-## 12. Risks and decisions blocking the plan
+## 12. Decisions — resolved and still open
 
-These should be answered before any code is written:
+**Resolved:**
+- Server language: **Node.js (TypeScript)**.
+- Database: **PostgreSQL** as the source of truth for transcription status and history.
+- Storage: **temp folder in dev, S3/R2/MinIO in production**.
+- Video playback: **YouTube IFrame in the Flutter app**; server never re-streams video.
+- Audio extraction: **yt-dlp (audio-only) or yt-dlp + ffmpeg**, temp file deleted after Soniox returns.
+- Teleprompter behaviour: overlay on video, two states (default = covers bottom half; word-selected = sits above translation pane). No drag, no free snap points.
+- Karaoke word highlight: **on** during playback.
+- Word tap: single word in UI, but full sentence sent as context to the LLM.
+- Playback speed control: **in v1**.
+- Begin-of-sentence back button: **in v1**.
+- Saved words list: **in v1**.
 
-1. **YouTube ToS / legal posture.** Downloading audio via `yt-dlp` is a technical grey area. For a paid product this needs a clear answer. Options: (a) accept the risk and ship, (b) require users to upload videos they own, (c) use only the IFrame player + YouTube's own captions when present. Recommendation: ship with `yt-dlp` for audio extraction (audio is deleted after transcription, video is never redistributed), but be aware.
-2. **Server language**: Node/TS vs. Python. Pick one.
-3. **Subscription model**: A, B, or C above.
-4. **Free tier**: yes / no, and how generous.
-5. **TTS provider strategy**: ElevenLabs only, or mix cheap + premium.
-6. **Initial supported language pairs**: which source languages, which target languages.
-7. **Max video duration** for v1.
-8. **Hosting / infrastructure**: where does the server run? (VPS, Fly.io, Railway, AWS, etc.) Affects how `yt-dlp`, ffmpeg, queue workers, and storage are deployed.
-9. **Repo structure**: monorepo (app + server + website + shared types) vs. separate repos. Recommend monorepo for v1.
+**Still open (need answers before the plan):**
+1. **YouTube ToS / legal posture.** `yt-dlp` audio extraction is a technical grey area. Options: (a) accept the risk and ship, (b) require users to upload videos they own, (c) use only the IFrame player + YouTube's own captions when present. Default recommendation: ship with `yt-dlp` (audio is deleted after transcription, video is never redistributed) and revisit if it becomes a problem.
+2. **Subscription model**: simple monthly pool (A), daily + monthly cap (B), or credits (C). Recommend A.
+3. **Free tier**: yes/no and how generous (e.g., 30 minutes/month free, or first video free).
+4. **TTS provider strategy**: ElevenLabs only, or ElevenLabs for full sentences + a cheaper provider (Google Cloud TTS / Azure) for single words.
+5. **Initial supported language pairs**: which source languages, which target languages.
+6. **Max video duration** for v1 (recommend 60 minutes).
+7. **Hosting / infrastructure**: where does the server run? (VPS, Fly.io, Railway, AWS, etc.) Affects how `yt-dlp`, ffmpeg, queue workers, and storage are deployed.
+8. **Repo structure**: monorepo (Flutter app + Node server + Next.js website + shared TS types) vs. separate repos. Recommend monorepo.
 
 ---
 
@@ -228,7 +243,10 @@ These should be answered before any code is written:
 - Google sign-in.
 - Share-from-YouTube + URL input.
 - Server-side transcription via Soniox.
-- Player with synced teleprompter, tap-to-translate, TTS.
+- Player with synced teleprompter, **karaoke word highlight**, tap-to-translate (single word, full-sentence context to LLM), TTS.
+- **Begin-of-sentence back button**.
+- **Playback speed control** (0.5x / 0.75x / 1x / 1.25x / 1.5x).
+- **Saved words list** (server-stored, accessible from profile).
 - History list with statuses, pull-to-refresh.
 - Profile + target language selection.
 - Website with sign in, pricing, PayPal subscription, account management.
@@ -237,16 +255,15 @@ These should be answered before any code is written:
 **v2 (defer):**
 - iOS build.
 - Tablet layout.
-- Saved words / flashcards.
-- Sentence-level tap and translation.
-- Loop / replay segment.
-- Playback speed control.
+- Multi-word / phrase selection in the teleprompter.
+- Loop / replay segment beyond single-sentence jump-back.
 - Use existing YouTube captions when high quality, skip Soniox.
 - Multiple voice options for TTS.
 - Add-on hour packs.
+- Flashcard / SRS review mode built on top of saved words.
 
 ---
 
 ## 14. Next step
 
-Before producing a plan, the user should answer the decision points in §12 (at minimum: server language, subscription model, free tier, ToS posture, hosting). With those answered, the plan can be concrete instead of branching.
+The remaining open items in §12 (ToS posture, subscription model, free tier, TTS provider strategy, initial language pairs, max video duration, hosting, repo structure) should be answered. With those answered, the plan can be concrete instead of branching.
